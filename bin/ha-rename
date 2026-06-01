@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+ha-rename - Bulk Home Assistant entity_id renames over a SINGLE WebSocket session
+
+Unlike `ha-ws entity update <old> new_entity_id=<new>` (which opens a fresh
+connection per call), ha-rename loads the entity registry once, validates every
+rename, then sends all updates over ONE authenticated WebSocket connection.
+
+USAGE
+  ha-rename <old> <new> [friendly_name]   Single rename
+  ha-rename --map <file.json>             Bulk rename from a JSON file
+
+MAP FILE FORMATS (all normalized internally)
+  Array of pairs:    [["light.old", "light.new"], ...]
+  Array w/ name:     [["light.old", "light.new", "Friendly Name"], ...]
+  Object old->new:   {"light.old": "light.new", ...}
+  Object old->spec:  {"light.old": {"new_entity_id": "light.new", "name": "Friendly Name"}, ...}
+
+OPTIONS
+  --map <file>      Read renames from a JSON file (see formats above)
+  --dry-run         Print what WOULD change; make NO changes
+  --force           Apply even if a NEW id collides with an existing entity
+  --json            Machine-readable JSON output
+  -q, --quiet       Minimal output
+  -h, --help        Show this help
+
+BEHAVIOR
+  - Loads the entity registry once (config/entity_registry/list).
+  - Validates each OLD id exists in the registry; missing ones are warned + skipped.
+  - Collision check (abort unless --force): aborts if any NEW already exists in
+    the registry or live states, or if two NEWs are identical.
+  - Sends config/entity_registry/update {entity_id=<old>, new_entity_id=<new>,
+    [name=<friendly>]} for each rename over one connection.
+
+NOTE
+  A registry rename does NOT update dashboards / automations / config_entries.
+  Run `ha-refs <old-ids>` first to find references that need patching.
+
+EXAMPLES
+  ha-rename light.old_lamp light.new_lamp
+  ha-rename light.old_lamp light.new_lamp "New Lamp"
+  ha-rename --map renames.json --dry-run
+  ha-rename --map renames.json
+"""
+
+import asyncio
+import json
+import os
+import re
+import ssl
+import subprocess as _sp
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+import websockets
+
+
+class HAWebSocket:
+    """Home Assistant WebSocket client (connection/auth copied from ha-ws)."""
+
+    def __init__(self, json_output: bool = False, quiet: bool = False):
+        self.ws = None
+        self.msg_id = 0
+        self.json_output = json_output
+        self.quiet = quiet
+        self._load_env()
+
+    def _load_env(self):
+        """Load environment from .env file or environment variables."""
+        env_files = [
+            os.environ.get('HA_ENV_FILE', ''),
+            '/config/.env',
+            '/homeassistant/.env',
+            './.env',
+            str(Path.home() / '.ha-cli.env'),
+        ]
+
+        for env_file in env_files:
+            if env_file and os.path.exists(env_file):
+                with open(env_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if '=' in line and not line.startswith('#'):
+                            k, v = line.split('=', 1)
+                            os.environ[k] = v
+                break
+
+        self.ha_url = os.environ.get('HA_URL', '').replace('https://', 'wss://').replace('http://', 'ws://')
+        self.ha_token = os.environ.get('HA_TOKEN', '')
+        # macOS Python's getaddrinfo doesn't use mDNSResponder, so it
+        # can't resolve .local hostnames the way curl/ping do. Substitute
+        # the IP from dscacheutil so websockets.connect can proceed.
+        m = re.match(r'^(wss?://)([^:/]+)(.*)$', self.ha_url)
+        if m and m.group(2).endswith('.local'):
+            try:
+                r = _sp.run(['dscacheutil', '-q', 'host', '-a', 'name', m.group(2)],
+                            capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    if line.startswith('ip_address:'):
+                        self.ha_url = f'{m.group(1)}{line.split()[1]}{m.group(3)}'
+                        break
+            except Exception:
+                pass
+
+    async def connect(self):
+        if not self.ha_url or not self.ha_token:
+            self._error("HA_URL and HA_TOKEN must be set in .env or environment")
+            return False
+
+        connect_kwargs = {"max_size": 50_000_000}
+        if self.ha_url.startswith("wss://"):
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            connect_kwargs["ssl"] = ssl_ctx
+
+        try:
+            self.ws = await websockets.connect(
+                f'{self.ha_url}/api/websocket',
+                **connect_kwargs,
+            )
+
+            msg = json.loads(await self.ws.recv())
+            if msg["type"] != "auth_required":
+                self._error(f"Unexpected: {msg}")
+                return False
+
+            await self.ws.send(json.dumps({"type": "auth", "access_token": self.ha_token}))
+            msg = json.loads(await self.ws.recv())
+            if msg["type"] != "auth_ok":
+                self._error(f"Auth failed: {msg}")
+                return False
+
+            return True
+        except Exception as e:
+            self._error(f"Connection failed: {e}")
+            return False
+
+    async def send(self, msg_type: str, **kwargs) -> dict:
+        self.msg_id += 1
+        payload = {"id": self.msg_id, "type": msg_type, **kwargs}
+        await self.ws.send(json.dumps(payload))
+        return json.loads(await self.ws.recv())
+
+    async def close(self):
+        if self.ws:
+            await self.ws.close()
+
+    def _print(self, msg: str):
+        if not self.quiet:
+            print(msg)
+
+    def _error(self, msg: str):
+        print(f"ERROR: {msg}", file=sys.stderr)
+
+
+# ==============================================================================
+# RENAME NORMALIZATION
+# ==============================================================================
+
+def _coerce_one(old: Any, new_spec: Any) -> dict:
+    """Normalize a single (old, new_spec) into {old, new, name}."""
+    if not isinstance(old, str) or not old:
+        raise ValueError(f"OLD id must be a non-empty string, got: {old!r}")
+
+    name = None
+    if isinstance(new_spec, str):
+        new = new_spec
+    elif isinstance(new_spec, dict):
+        new = new_spec.get("new_entity_id") or new_spec.get("new")
+        name = new_spec.get("name") or new_spec.get("friendly_name")
+    else:
+        raise ValueError(f"NEW spec for {old!r} must be a string or object, got: {new_spec!r}")
+
+    if not isinstance(new, str) or not new:
+        raise ValueError(f"NEW id for {old!r} must be a non-empty string, got: {new!r}")
+
+    return {"old": old, "new": new, "name": name}
+
+
+def normalize_map(data: Any) -> list:
+    """Normalize any supported map shape into a list of {old, new, name}."""
+    renames = []
+    if isinstance(data, list):
+        for i, item in enumerate(data):
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                raise ValueError(f"Array entry #{i} must be [old, new] or [old, new, name], got: {item!r}")
+            old, new = item[0], item[1]
+            name = item[2] if len(item) >= 3 else None
+            r = _coerce_one(old, new)
+            if name is not None:
+                r["name"] = name
+            renames.append(r)
+    elif isinstance(data, dict):
+        for old, new_spec in data.items():
+            renames.append(_coerce_one(old, new_spec))
+    else:
+        raise ValueError("Map file must be a JSON array or object")
+    return renames
+
+
+# ==============================================================================
+# CORE
+# ==============================================================================
+
+async def run_rename(ha: HAWebSocket, renames: list, dry_run: bool, force: bool) -> int:
+    """Validate, collision-check, and apply renames. Returns exit code."""
+    out = {"dry_run": dry_run, "force": force, "renames": [],
+           "renamed": 0, "skipped": 0, "failed": 0, "collisions": []}
+
+    # --- Load registry + live states once -------------------------------------
+    reg = await ha.send("config/entity_registry/list")
+    if not reg.get("success"):
+        ha._error(f"Failed to load entity registry: {reg.get('error', reg)}")
+        return 1
+    reg_ids = {e["entity_id"] for e in reg["result"]}
+
+    states = await ha.send("get_states")
+    live_ids = {s["entity_id"] for s in states["result"]} if states.get("success") else set()
+    existing = reg_ids | live_ids
+
+    # --- Validate OLD existence; warn + skip missing --------------------------
+    valid = []
+    for r in renames:
+        if r["old"] not in reg_ids:
+            r["status"] = "skipped"
+            r["reason"] = "old id not found in registry"
+            out["renames"].append(r)
+            out["skipped"] += 1
+            if not ha.json_output:
+                ha._error(f"SKIP {r['old']} -> {r['new']}: old id not in registry")
+        else:
+            valid.append(r)
+
+    # --- Collision check ------------------------------------------------------
+    collisions = []
+    seen_new = {}
+    for r in valid:
+        new = r["new"]
+        # NEW already exists (and isn't just the same entity being renamed to itself)
+        if new in existing and new != r["old"]:
+            collisions.append((r["old"], new, "new id already exists"))
+        # Two renames target the same NEW id
+        if new in seen_new:
+            collisions.append((r["old"], new, f"duplicate NEW (also from {seen_new[new]})"))
+        else:
+            seen_new[new] = r["old"]
+
+    out["collisions"] = [{"old": o, "new": n, "reason": why} for o, n, why in collisions]
+
+    if collisions and not force:
+        if not ha.json_output:
+            ha._error(f"ABORT: {len(collisions)} collision(s) detected (use --force to override):")
+            for o, n, why in collisions:
+                ha._error(f"  {o} -> {n}: {why}")
+        else:
+            print(json.dumps(out, indent=2, default=str))
+        # Mark valid renames as not-applied for the summary
+        return 2
+
+    # --- Apply (or dry-run) ---------------------------------------------------
+    for r in valid:
+        updates = {"new_entity_id": r["new"]}
+        if r.get("name"):
+            updates["name"] = r["name"]
+
+        if dry_run:
+            r["status"] = "would-rename"
+            out["renames"].append(r)
+            if not ha.json_output:
+                extra = f' name="{r["name"]}"' if r.get("name") else ""
+                ha._print(f"DRY-RUN would rename {r['old']} -> {r['new']}{extra}")
+            continue
+
+        result = await ha.send("config/entity_registry/update", entity_id=r["old"], **updates)
+        if result.get("success"):
+            r["status"] = "renamed"
+            out["renames"].append(r)
+            out["renamed"] += 1
+            if not ha.json_output:
+                extra = f' name="{r["name"]}"' if r.get("name") else ""
+                ha._print(f"OK   {r['old']} -> {r['new']}{extra}")
+        else:
+            r["status"] = "failed"
+            r["reason"] = str(result.get("error", result))
+            out["renames"].append(r)
+            out["failed"] += 1
+            if not ha.json_output:
+                ha._error(f"FAIL {r['old']} -> {r['new']}: {r['reason']}")
+
+    # --- Summary --------------------------------------------------------------
+    if ha.json_output:
+        print(json.dumps(out, indent=2, default=str))
+    else:
+        verb = "would rename" if dry_run else "renamed"
+        n_main = len(valid) if dry_run else out["renamed"]
+        ha._print("")
+        ha._print(f"{verb} {n_main}, skipped {out['skipped']}, failed {out['failed']}")
+        ha._print("")
+        ha._print("NOTE: a registry rename does NOT update dashboards/automations/"
+                  "config_entries.")
+        ha._print("      run `ha-refs <old-ids>` first to find references that need patching.")
+
+    return 0 if out["failed"] == 0 else 1
+
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
+def _load_map_file(path: str) -> list:
+    p = Path(path).expanduser()
+    if not p.exists():
+        print(f"ERROR: map file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        data = json.loads(p.read_text())
+    except Exception as e:
+        print(f"ERROR: failed to parse JSON map file {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        return normalize_map(data)
+    except ValueError as e:
+        print(f"ERROR: invalid map file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+async def _main_async(renames: list, json_output: bool, quiet: bool,
+                      dry_run: bool, force: bool) -> int:
+    ha = HAWebSocket(json_output=json_output, quiet=quiet)
+    if not await ha.connect():
+        return 1
+    try:
+        return await run_rename(ha, renames, dry_run, force)
+    finally:
+        await ha.close()
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        sys.exit(0)
+
+    json_output = False
+    quiet = False
+    dry_run = False
+    force = False
+    map_file = None
+
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--json":
+            json_output = True
+        elif a in ("-q", "--quiet"):
+            quiet = True
+        elif a == "--dry-run":
+            dry_run = True
+        elif a == "--force":
+            force = True
+        elif a == "--map":
+            i += 1
+            if i >= len(args):
+                print("ERROR: --map requires a file argument", file=sys.stderr)
+                sys.exit(1)
+            map_file = args[i]
+        else:
+            positional.append(a)
+        i += 1
+
+    # --- Build the rename list ------------------------------------------------
+    if map_file:
+        if positional:
+            print("ERROR: cannot combine --map with positional <old> <new> args",
+                  file=sys.stderr)
+            sys.exit(1)
+        renames = _load_map_file(map_file)
+    else:
+        if len(positional) < 2:
+            print("ERROR: need <old> <new> [friendly_name], or --map <file.json>",
+                  file=sys.stderr)
+            print("       run with --help for usage", file=sys.stderr)
+            sys.exit(1)
+        old, new = positional[0], positional[1]
+        name = positional[2] if len(positional) >= 3 else None
+        r = {"old": old, "new": new, "name": name}
+        renames = [r]
+
+    if not renames:
+        print("ERROR: no renames to perform", file=sys.stderr)
+        sys.exit(1)
+
+    code = asyncio.run(_main_async(renames, json_output, quiet, dry_run, force))
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

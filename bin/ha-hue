@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""
+ha-hue - Inspect & edit the Philips Hue bridge via its CLIP v2 API.
+
+Hue switch button configs and scene contents live ON THE BRIDGE, not in Home
+Assistant. This tool talks to the bridge directly, with auth handled
+automatically and rid<->name resolution built in (Hue speaks in UUIDs).
+
+USAGE
+  Inspect (read-only):
+    ha-hue lights [filter]            Lights: name | on | bri% | caps | room
+    ha-hue rooms                      Rooms + member lights
+    ha-hue zones                      Zones + member lights
+    ha-hue scenes [room]              Scenes grouped by room/zone
+    ha-hue scene <name|id> [--room R] Per-light actions in a scene
+    ha-hue switches                   List switches/dimmers
+    ha-hue switch <name>              Decode a switch's button config
+    ha-hue raw <GET|PUT|POST|DELETE> <path> [json]
+                                      Auth'd CLIP passthrough (path rel to /clip/v2/)
+
+  Scene editing:
+    ha-hue scene-recall <name|id>     Activate a scene (safe)
+    ha-hue scene-set <scene> <light> [on=..] [bri=NN] [ct=NNNN] [color=#hex|x,y]
+                                      Edit ONE light's action in a scene
+    ha-hue scene-create <name> <room> [--from-current]
+    ha-hue scene-delete <name|id> --yes
+
+  Switch (behavior_instance) editing:
+    ha-hue switch-schedule <switch> <button> "HH:MM=Scene,HH:MM=Scene,..."
+    ha-hue switch-cycle <switch> <button> "SceneA,SceneB,SceneC"
+    ha-hue switch-action <switch> <button> <all_off|dim_up|dim_down|nothing>
+    ha-hue switch-swap-scene <switch> <oldScene> <newScene>
+      <button> is top|bottom|dim_up|dim_down or a control_id 1-4.
+
+GLOBAL OPTIONS
+  --json            Raw API JSON output
+  --dry-run         (writes) Print intended change, do nothing
+  --yes             (deletes) Required to actually delete
+  --room R          Disambiguate a scene/light name by room
+  -h, --help        This help
+
+AUTH BOOTSTRAP (automatic, in order)
+  1. HUE_HOST / HUE_KEY environment variables
+  2. ~/.ha-cli-hue.env  (cached, chmod 600)
+  3. ssh-fetch the app key from HA's config entry, then write the cache file.
+"""
+
+import json
+import os
+import ssl
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+CACHE = Path.home() / ".ha-cli-hue.env"
+DEFAULT_HOST = os.environ.get("HUE_HOST", "")  # set HUE_HOST or ~/.ha-cli-hue.env
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
+
+# ---------------------------------------------------------------- auth / http
+def _fetch_key_via_ssh(host):
+    """Pull the Hue app key from HA's config_entries over ssh."""
+    code = (
+        "import json;"
+        'd=json.load(open("/config/.storage/core.config_entries"));'
+        '[print(e["data"]["api_key"]) for e in d["data"]["entries"] '
+        'if e["domain"]=="hue" and e["data"].get("host")=="%s"]' % host
+    )
+    out = subprocess.run(
+        ["ssh", "ha", "python3 -c '%s'" % code],
+        capture_output=True, text=True, timeout=20,
+    )
+    key = out.stdout.strip().splitlines()
+    if not key:
+        sys.exit("ha-hue: could not fetch Hue app key via ssh (stderr: %s)"
+                 % out.stderr.strip())
+    return key[0].strip()
+
+
+def load_auth():
+    host = os.environ.get("HUE_HOST")
+    key = os.environ.get("HUE_KEY")
+    if host and key:
+        return host, key
+    if CACHE.exists():
+        env = {}
+        for line in CACHE.read_text().splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+        host = host or env.get("HUE_HOST")
+        key = key or env.get("HUE_KEY")
+        if host and key:
+            return host, key
+    # bootstrap via ssh
+    host = host or DEFAULT_HOST
+    if not host:
+        sys.exit("ha-hue: no Hue bridge host. Set HUE_HOST (env) or add "
+                 "HUE_HOST=<bridge-ip> to ~/.ha-cli-hue.env.")
+    key = _fetch_key_via_ssh(host)
+    CACHE.write_text("HUE_HOST=%s\nHUE_KEY=%s\n" % (host, key))
+    CACHE.chmod(0o600)
+    sys.stderr.write("ha-hue: cached Hue credentials to %s\n" % CACHE)
+    return host, key
+
+
+class Hue:
+    def __init__(self):
+        self.host, self.key = load_auth()
+        self.base = "https://%s/clip/v2/" % self.host
+        self._cache = {}
+
+    def request(self, method, path, body=None):
+        url = self.base + path.lstrip("/")
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("hue-application-key", self.key)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as r:
+                raw = r.read().decode()
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode()
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = {"errors": [{"description": raw}]}
+            return parsed
+        return json.loads(raw) if raw else {}
+
+    def get(self, rtype, force=False):
+        """Fetch and cache a resource collection -> list of resources."""
+        if force or rtype not in self._cache:
+            self._cache[rtype] = self.request("GET", "resource/" + rtype).get("data", [])
+        return self._cache[rtype]
+
+    def by_id(self, rtype):
+        return {r["id"]: r for r in self.get(rtype)}
+
+
+# ---------------------------------------------------------------- helpers
+def mirek_to_k(m):
+    return round(1_000_000 / m) if m else None
+
+
+def k_to_mirek(k):
+    return round(1_000_000 / k)
+
+
+def name_of(res):
+    return res.get("metadata", {}).get("name", res.get("id", "?")[:8])
+
+
+def short(rid):
+    return rid.split("-")[0]
+
+
+def resolve_scene(hue, key, room=None):
+    """Find a scene by name (case-insensitive) or id; optional room filter."""
+    scenes = hue.get("scene")
+    # exact id
+    for s in scenes:
+        if s["id"] == key or s["id"].startswith(key) and len(key) >= 8:
+            return s
+    rooms = hue.by_id("room")
+    zones = hue.by_id("zone")
+
+    def group_name(s):
+        g = s.get("group", {})
+        col = rooms if g.get("rtype") == "room" else zones
+        return name_of(col.get(g.get("rid"), {})) if g.get("rid") in col else "?"
+
+    matches = [s for s in scenes if name_of(s).lower() == key.lower()]
+    if room:
+        matches = [s for s in matches if group_name(s).lower() == room.lower()]
+    if not matches:
+        sys.exit("ha-hue: no scene named %r%s"
+                 % (key, " in room %r" % room if room else ""))
+    if len(matches) > 1:
+        opts = ", ".join("%s [%s]" % (name_of(s), group_name(s)) for s in matches)
+        sys.exit("ha-hue: ambiguous scene %r — disambiguate with --room. Matches: %s"
+                 % (key, opts))
+    return matches[0]
+
+
+def resolve_light(hue, key):
+    lights = hue.get("light")
+    for l in lights:
+        if l["id"] == key:
+            return l
+    matches = [l for l in lights if name_of(l).lower() == key.lower()]
+    if not matches:
+        sys.exit("ha-hue: no light named %r" % key)
+    if len(matches) > 1:
+        sys.exit("ha-hue: ambiguous light %r" % key)
+    return matches[0]
+
+
+def resolve_behavior(hue, key):
+    """Find a behavior_instance (switch config) by metadata.name or id."""
+    bis = hue.get("behavior_instance")
+    for b in bis:
+        if b["id"] == key:
+            return b
+    matches = [b for b in bis if name_of(b).lower() == key.lower()]
+    if not matches:
+        names = ", ".join(name_of(b) for b in bis)
+        sys.exit("ha-hue: no switch named %r. Known: %s" % (key, names))
+    if len(matches) > 1:
+        sys.exit("ha-hue: ambiguous switch %r" % key)
+    return matches[0]
+
+
+def button_control_map(hue):
+    """rid -> control_id for every button resource."""
+    return {b["id"]: b["metadata"]["control_id"] for b in hue.get("button")}
+
+
+# control_id semantics for a 4-button dimmer
+CTRL_LABEL = {1: "top (on)", 2: "dim▲", 3: "dim▼", 4: "bottom (off)"}
+BUTTON_ALIASES = {"top": 1, "on": 1, "dim_up": 2, "dimup": 2,
+                  "dim_down": 3, "dimdown": 3, "bottom": 4, "off": 4}
+
+
+def resolve_button_ctrl(token):
+    t = token.lower()
+    if t in BUTTON_ALIASES:
+        return BUTTON_ALIASES[t]
+    if t.isdigit() and 1 <= int(t) <= 4:
+        return int(t)
+    sys.exit("ha-hue: bad button %r (use top|bottom|dim_up|dim_down or 1-4)" % token)
+
+
+def find_button_rid(hue, behavior, control_id):
+    cmap = button_control_map(hue)
+    for rid in behavior["configuration"].get("buttons", {}):
+        if cmap.get(rid) == control_id:
+            return rid
+    sys.exit("ha-hue: switch %r has no button at control_id %d"
+             % (name_of(behavior), control_id))
+
+
+def light_caps(l):
+    if "color" in l:
+        return "COLOR gamut %s" % l["color"].get("gamut_type", "?")
+    if "color_temperature" in l:
+        sch = l["color_temperature"].get("mirek_schema", {})
+        lo, hi = sch.get("mirek_minimum"), sch.get("mirek_maximum")
+        if lo and hi:
+            return "CT %d-%dK" % (mirek_to_k(hi), mirek_to_k(lo))
+        return "CT"
+    return "on/off"
+
+
+def light_room_map(hue):
+    """light rid -> room name (via room.children which are devices; lights owned by device)."""
+    rooms = hue.get("room")
+    devices = hue.by_id("device")
+    # device rid -> room name
+    dev_room = {}
+    for r in rooms:
+        for child in r.get("children", []):
+            if child.get("rtype") == "device":
+                dev_room[child["rid"]] = name_of(r)
+    out = {}
+    for l in hue.get("light"):
+        owner = l.get("owner", {})
+        if owner.get("rtype") == "device":
+            out[l["id"]] = dev_room.get(owner["rid"], "")
+    return out
+
+
+# ---------------------------------------------------------------- describe action
+def describe_action(act):
+    """Human string for a scene action dict."""
+    parts = []
+    on = act.get("on", {}).get("on")
+    if on is False:
+        return "off"
+    if on is True:
+        parts.append("on")
+    if "dimming" in act:
+        parts.append("%d%%" % round(act["dimming"]["brightness"]))
+    if "color_temperature" in act:
+        m = act["color_temperature"].get("mirek")
+        if m:
+            parts.append("%dK" % mirek_to_k(m))
+    if "color" in act:
+        xy = act["color"].get("xy", {})
+        parts.append("xy(%.3f,%.3f)" % (xy.get("x", 0), xy.get("y", 0)))
+    return " ".join(parts) if parts else "(no-op)"
+
+
+def describe_button(hue, btn_cfg):
+    """Decode one button's configuration dict -> human lines."""
+    scenes = hue.by_id("scene")
+    rooms = hue.by_id("room")
+    zones = hue.by_id("zone")
+
+    def rid_name(rid, rtype):
+        col = {"scene": scenes, "room": rooms, "zone": zones}.get(rtype, {})
+        return name_of(col[rid]) if rid in col else short(rid)
+
+    def slot_scene(slot_actions):
+        for a in slot_actions:
+            rec = a.get("action", {}).get("recall", {})
+            if rec:
+                return rid_name(rec["rid"], rec["rtype"])
+        return "?"
+
+    out = []
+    for evt in ("on_short_release", "on_repeat", "on_long_press"):
+        if evt not in btn_cfg:
+            continue
+        cfg = btn_cfg[evt]
+        label = evt.replace("on_", "")
+        if "action" in cfg:
+            out.append("%s: %s" % (label, cfg["action"]))
+        elif "time_based_extended" in cfg:
+            tb = cfg["time_based_extended"]
+            slots = []
+            for s in tb.get("slots", []):
+                st = s.get("start_time", {})
+                slots.append("%02d:%02d %s" % (st.get("hour", 0), st.get("minute", 0),
+                                               slot_scene(s.get("actions", []))))
+            woff = " +off" if tb.get("with_off", {}).get("enabled") else ""
+            out.append("%s: time[%s]%s" % (label, " | ".join(slots), woff))
+        elif "scene_cycle_extended" in cfg:
+            sc = cfg["scene_cycle_extended"]
+            names = [slot_scene(slot) for slot in sc.get("slots", [])]
+            woff = " +off" if sc.get("with_off", {}).get("enabled") else ""
+            out.append("%s: cycle[%s]%s" % (label, " → ".join(names), woff))
+        else:
+            out.append("%s: %s" % (label, ", ".join(cfg.keys())))
+    return out
+
+
+# ---------------------------------------------------------------- Tier 1 cmds
+def cmd_lights(hue, args, as_json):
+    filt = args[0].lower() if args else None
+    rmap = light_room_map(hue)
+    lights = sorted(hue.get("light"), key=name_of)
+    rows = []
+    for l in lights:
+        n = name_of(l)
+        if filt and filt not in n.lower():
+            continue
+        if as_json:
+            rows.append(l)
+            continue
+        on = "on" if l.get("on", {}).get("on") else "off"
+        bri = "%d%%" % round(l.get("dimming", {}).get("brightness", 0)) if "dimming" in l else "-"
+        rows.append((n, on, bri, light_caps(l), rmap.get(l["id"], "")))
+    if as_json:
+        print(json.dumps(rows, indent=2)); return
+    w = max([len(r[0]) for r in rows] + [4])
+    for n, on, bri, caps, room in rows:
+        print("%-*s  %-3s  %4s  %-20s  %s" % (w, n, on, bri, caps, room))
+
+
+def cmd_rooms(hue, args, as_json, rtype="room"):
+    items = hue.get(rtype)
+    lights = hue.by_id("light")
+    devices = hue.by_id("device")
+    if as_json:
+        print(json.dumps(items, indent=2)); return
+    for r in sorted(items, key=name_of):
+        names = []
+        for child in r.get("children", []):
+            if child.get("rtype") == "device":
+                dev = devices.get(child["rid"], {})
+                # light services on the device
+                for svc in dev.get("services", []):
+                    if svc.get("rtype") == "light" and svc["rid"] in lights:
+                        names.append(name_of(lights[svc["rid"]]))
+            elif child.get("rtype") == "light" and child["rid"] in lights:
+                names.append(name_of(lights[child["rid"]]))
+        print("%s: %s" % (name_of(r), ", ".join(sorted(names)) or "(none)"))
+
+
+def cmd_scenes(hue, args, as_json):
+    room_filter = args[0].lower() if args else None
+    scenes = hue.get("scene")
+    rooms = hue.by_id("room")
+    zones = hue.by_id("zone")
+
+    def gname(s):
+        g = s.get("group", {})
+        col = rooms if g.get("rtype") == "room" else zones
+        return name_of(col.get(g.get("rid"), {})) if g.get("rid") in col else "?"
+
+    if as_json:
+        print(json.dumps(scenes, indent=2)); return
+    groups = {}
+    for s in scenes:
+        g = gname(s)
+        if room_filter and room_filter not in g.lower():
+            continue
+        groups.setdefault(g, []).append(s)
+    for g in sorted(groups):
+        print("%s:" % g)
+        for s in sorted(groups[g], key=name_of):
+            print("  %-20s %s" % (name_of(s), short(s["id"])))
+
+
+def cmd_scene(hue, args, as_json):
+    room = None
+    if "--room" in args:
+        i = args.index("--room"); room = args[i + 1]; args = args[:i] + args[i + 2:]
+    if not args:
+        sys.exit("usage: ha-hue scene <name|id> [--room R]")
+    s = resolve_scene(hue, args[0], room)
+    if as_json:
+        print(json.dumps(s, indent=2)); return
+    lights = hue.by_id("light")
+    print("Scene: %s  [%s]" % (name_of(s), short(s["id"])))
+    for a in s.get("actions", []):
+        tgt = a.get("target", {})
+        ln = name_of(lights.get(tgt.get("rid"), {})) if tgt.get("rid") in lights else short(tgt.get("rid", ""))
+        print("  %-18s %s" % (ln, describe_action(a.get("action", {}))))
+
+
+def cmd_switches(hue, args, as_json):
+    bis = hue.get("behavior_instance")
+    if as_json:
+        print(json.dumps(bis, indent=2)); return
+    for b in sorted(bis, key=name_of):
+        nbtn = len(b["configuration"].get("buttons", {}))
+        en = "enabled" if b.get("enabled") else "disabled"
+        print("%-22s %s  %d buttons  [%s]" % (name_of(b), en, nbtn, short(b["id"])))
+
+
+def cmd_switch(hue, args, as_json):
+    if not args:
+        sys.exit("usage: ha-hue switch <name>")
+    b = resolve_behavior(hue, args[0])
+    if as_json:
+        print(json.dumps(b, indent=2)); return
+    cmap = button_control_map(hue)
+    rooms = hue.by_id("room")
+    print("Switch: %s  [%s]  %s" % (name_of(b), short(b["id"]),
+                                     "enabled" if b.get("enabled") else "disabled"))
+    btns = b["configuration"].get("buttons", {})
+    # bound room (from any button's where)
+    for cfg in btns.values():
+        where = cfg.get("where") or []
+        for w in where:
+            g = w.get("group", {})
+            if g.get("rtype") == "room" and g["rid"] in rooms:
+                print("  bound room: %s" % name_of(rooms[g["rid"]]))
+                break
+        else:
+            continue
+        break
+    for rid in sorted(btns, key=lambda r: cmap.get(r, 99)):
+        ctrl = cmap.get(rid, "?")
+        lbl = CTRL_LABEL.get(ctrl, "button %s" % ctrl)
+        print("  [%s] %s" % (ctrl, lbl))
+        for line in describe_button(hue, btns[rid]):
+            print("      %s" % line)
+
+
+def cmd_raw(hue, args, as_json):
+    if len(args) < 2:
+        sys.exit("usage: ha-hue raw <GET|PUT|POST|DELETE> <path> [json]")
+    method, path = args[0].upper(), args[1]
+    body = json.loads(args[2]) if len(args) > 2 else None
+    print(json.dumps(hue.request(method, path, body), indent=2))
+
+
+# ---------------------------------------------------------------- Tier 2 cmds
+def _put_check(hue, path, body, dry):
+    if dry:
+        print("[dry-run] PUT %s" % path)
+        print(json.dumps(body, indent=2))
+        return True
+    res = hue.request("PUT", path, body)
+    errs = res.get("errors", [])
+    if errs:
+        print("ERROR: %s" % json.dumps(errs))
+        return False
+    print("OK: %s" % json.dumps(res.get("data", res)))
+    return True
+
+
+def cmd_scene_recall(hue, args, as_json, dry):
+    if not args:
+        sys.exit("usage: ha-hue scene-recall <name|id>")
+    room = None
+    if "--room" in args:
+        i = args.index("--room"); room = args[i + 1]; args = args[:i] + args[i + 2:]
+    s = resolve_scene(hue, args[0], room)
+    _put_check(hue, "resource/scene/" + s["id"],
+               {"recall": {"action": "active"}}, dry)
+
+
+def _parse_setters(tokens, light, base=None):
+    """Build/merge a Hue action dict from key=value tokens for one light.
+
+    If `base` (the light's existing action in the scene) is given, unspecified
+    attributes are preserved — a setter is a partial edit, not a replacement.
+    Setting `color` clears `color_temperature` and vice-versa (mutually exclusive).
+    """
+    has_color = "color" in light
+    has_ct = "color_temperature" in light
+    act = json.loads(json.dumps(base)) if base else {}
+    for t in tokens:
+        if "=" not in t:
+            sys.exit("ha-hue: bad setter %r (expected key=value)" % t)
+        k, v = t.split("=", 1)
+        k = k.lower()
+        if k == "on":
+            act["on"] = {"on": v.lower() in ("1", "true", "on", "yes")}
+        elif k in ("bri", "brightness"):
+            act.setdefault("on", {"on": True})
+            act["dimming"] = {"brightness": float(v)}
+        elif k in ("ct", "kelvin", "k"):
+            if not has_ct:
+                print("WARN: %s has no color_temperature; ignoring ct" % name_of(light))
+            else:
+                act.setdefault("on", {"on": True})
+                act["color_temperature"] = {"mirek": k_to_mirek(int(v))}
+                act.pop("color", None)  # mutually exclusive
+        elif k == "color":
+            if not has_color:
+                print("WARN: %s is CT-only; ignoring color" % name_of(light))
+            else:
+                act.setdefault("on", {"on": True})
+                act["color"] = {"xy": _color_to_xy(v)}
+                act.pop("color_temperature", None)  # mutually exclusive
+        else:
+            sys.exit("ha-hue: unknown setter %r" % k)
+    return act
+
+
+def _color_to_xy(v):
+    if "," in v:
+        x, y = v.split(","); return {"x": float(x), "y": float(y)}
+    h = v.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    # sRGB -> linear -> CIE XYZ -> xy (Wide RGB D65, per Hue docs)
+    def lin(c):
+        return ((c + 0.055) / 1.055) ** 2.4 if c > 0.04045 else c / 12.92
+    r, g, b = lin(r), lin(g), lin(b)
+    X = r * 0.649926 + g * 0.103455 + b * 0.197109
+    Y = r * 0.234327 + g * 0.743075 + b * 0.022598
+    Z = r * 0.0000000 + g * 0.053077 + b * 1.035763
+    s = X + Y + Z or 1
+    return {"x": round(X / s, 4), "y": round(Y / s, 4)}
+
+
+def cmd_scene_set(hue, args, as_json, dry):
+    room = None
+    if "--room" in args:
+        i = args.index("--room"); room = args[i + 1]; args = args[:i] + args[i + 2:]
+    if len(args) < 3:
+        sys.exit("usage: ha-hue scene-set <scene> <light> [on=..] [bri=NN] [ct=NNNN] [color=#hex]")
+    s = resolve_scene(hue, args[0], room)
+    light = resolve_light(hue, args[1])
+    actions = json.loads(json.dumps(s["actions"]))  # deep copy
+    base = next((a["action"] for a in actions
+                 if a.get("target", {}).get("rid") == light["id"]), None)
+    new_action = _parse_setters(args[2:], light, base)
+    if not new_action:
+        sys.exit("ha-hue: no setters given")
+    found = False
+    for a in actions:
+        if a.get("target", {}).get("rid") == light["id"]:
+            a["action"] = new_action
+            found = True
+            break
+    if not found:
+        actions.append({"target": {"rid": light["id"], "rtype": "light"},
+                        "action": new_action})
+    print("scene-set %s / %s -> %s" % (name_of(s), name_of(light),
+                                       describe_action(new_action)))
+    _put_check(hue, "resource/scene/" + s["id"], {"actions": actions}, dry)
+
+
+def cmd_scene_create(hue, args, as_json, dry):
+    from_current = "--from-current" in args
+    args = [a for a in args if a != "--from-current"]
+    if len(args) < 2:
+        sys.exit("usage: ha-hue scene-create <name> <room> [--from-current]")
+    name, room_name = args[0], args[1]
+    rooms = hue.get("room")
+    rm = next((r for r in rooms if name_of(r).lower() == room_name.lower()), None)
+    if not rm:
+        sys.exit("ha-hue: no room %r" % room_name)
+    # gather room's light rids
+    devices = hue.by_id("device")
+    lights = hue.by_id("light")
+    light_rids = []
+    for child in rm.get("children", []):
+        if child.get("rtype") == "device":
+            for svc in devices.get(child["rid"], {}).get("services", []):
+                if svc.get("rtype") == "light" and svc["rid"] in lights:
+                    light_rids.append(svc["rid"])
+        elif child.get("rtype") == "light":
+            light_rids.append(child["rid"])
+    actions = []
+    for rid in light_rids:
+        l = lights[rid]
+        if from_current:
+            act = {"on": {"on": l.get("on", {}).get("on", True)}}
+            if "dimming" in l:
+                act["dimming"] = {"brightness": l["dimming"]["brightness"]}
+            if "color_temperature" in l and l["color_temperature"].get("mirek"):
+                act["color_temperature"] = {"mirek": l["color_temperature"]["mirek"]}
+            elif "color" in l and l["color"].get("xy"):
+                act["color"] = {"xy": l["color"]["xy"]}
+        else:
+            act = {"on": {"on": True}, "dimming": {"brightness": 100.0}}
+        actions.append({"target": {"rid": rid, "rtype": "light"}, "action": act})
+    body = {"type": "scene", "metadata": {"name": name},
+            "group": {"rid": rm["id"], "rtype": "room"}, "actions": actions}
+    print("scene-create %r in %s (%d lights, from_current=%s)"
+          % (name, name_of(rm), len(actions), from_current))
+    if dry:
+        print("[dry-run] POST resource/scene"); print(json.dumps(body, indent=2)); return
+    res = hue.request("POST", "resource/scene", body)
+    if res.get("errors"):
+        print("ERROR: %s" % json.dumps(res["errors"]))
+    else:
+        print("OK: %s" % json.dumps(res.get("data", res)))
+
+
+def cmd_scene_delete(hue, args, as_json, dry, yes):
+    room = None
+    if "--room" in args:
+        i = args.index("--room"); room = args[i + 1]; args = args[:i] + args[i + 2:]
+    if not args:
+        sys.exit("usage: ha-hue scene-delete <name|id> --yes")
+    s = resolve_scene(hue, args[0], room)
+    print("Would DELETE scene %r [%s]" % (name_of(s), short(s["id"])))
+    if dry:
+        print("[dry-run] DELETE resource/scene/%s" % s["id"]); return
+    if not yes:
+        sys.exit("Refusing to delete without --yes")
+    res = hue.request("DELETE", "resource/scene/" + s["id"])
+    print("ERROR: %s" % json.dumps(res["errors"]) if res.get("errors")
+          else "Deleted %r" % name_of(s))
+
+
+# ---------------------------------------------------------------- Tier 3 cmds
+def _scene_rid_in_room(hue, scene_name, room_name):
+    """Resolve a scene name to rid, restricted to the given room if possible."""
+    s = resolve_scene(hue, scene_name, room_name)
+    return s["id"]
+
+
+def _bound_room_name(hue, behavior):
+    rooms = hue.by_id("room")
+    for cfg in behavior["configuration"].get("buttons", {}).values():
+        for w in (cfg.get("where") or []):
+            g = w.get("group", {})
+            if g.get("rtype") == "room" and g["rid"] in rooms:
+                return name_of(rooms[g["rid"]])
+    return None
+
+
+def _edit_behavior(hue, behavior, mutate, dry):
+    """Deep-copy config, mutate(cfg), PUT, re-fetch & verify."""
+    import copy
+    cfg = copy.deepcopy(behavior["configuration"])
+    mutate(cfg)
+    bid = behavior["id"]
+    if dry:
+        print("[dry-run] PUT resource/behavior_instance/%s" % bid)
+        print(json.dumps({"configuration": cfg}, indent=2))
+        return
+    res = hue.request("PUT", "resource/behavior_instance/" + bid,
+                      {"configuration": cfg})
+    if res.get("errors"):
+        print("ERROR: %s" % json.dumps(res["errors"])); return
+    # verify
+    fresh = hue.request("GET", "resource/behavior_instance/" + bid)
+    fd = fresh.get("data", [{}])[0]
+    if fd.get("last_error"):
+        print("WARN: behavior reports last_error: %s" % fd["last_error"])
+    print("OK: updated %r" % name_of(behavior))
+
+
+def cmd_switch_schedule(hue, args, as_json, dry):
+    if len(args) < 3:
+        sys.exit('usage: ha-hue switch-schedule <switch> <button> "HH:MM=Scene,HH:MM=Scene"')
+    b = resolve_behavior(hue, args[0])
+    ctrl = resolve_button_ctrl(args[1])
+    rid = find_button_rid(hue, b, ctrl)
+    room = _bound_room_name(hue, b)
+    slots = []
+    for pair in args[2].split(","):
+        tm, scene = pair.split("=", 1)
+        hh, mm = tm.strip().split(":")
+        sid = _scene_rid_in_room(hue, scene.strip(), room)
+        slots.append({"actions": [{"action": {"recall": {"rid": sid, "rtype": "scene"}}}],
+                      "start_time": {"hour": int(hh), "minute": int(mm)}})
+    slots.sort(key=lambda s: (s["start_time"]["hour"], s["start_time"]["minute"]))
+
+    def mutate(cfg):
+        btn = cfg["buttons"][rid]
+        sr = btn.setdefault("on_short_release", {})
+        sr.pop("action", None); sr.pop("scene_cycle_extended", None)
+        tb = sr.setdefault("time_based_extended", {})
+        tb["slots"] = slots
+        tb.setdefault("with_off", {"enabled": True})
+    print("switch-schedule %s [%s] -> %s"
+          % (name_of(b), CTRL_LABEL.get(ctrl, ctrl), args[2]))
+    _edit_behavior(hue, b, mutate, dry)
+
+
+def cmd_switch_cycle(hue, args, as_json, dry):
+    if len(args) < 3:
+        sys.exit('usage: ha-hue switch-cycle <switch> <button> "SceneA,SceneB,SceneC"')
+    b = resolve_behavior(hue, args[0])
+    ctrl = resolve_button_ctrl(args[1])
+    rid = find_button_rid(hue, b, ctrl)
+    room = _bound_room_name(hue, b)
+    slots = []
+    for scene in args[2].split(","):
+        sid = _scene_rid_in_room(hue, scene.strip(), room)
+        slots.append([{"action": {"recall": {"rid": sid, "rtype": "scene"}}}])
+
+    def mutate(cfg):
+        btn = cfg["buttons"][rid]
+        sr = btn.setdefault("on_short_release", {})
+        sr.pop("action", None); sr.pop("time_based_extended", None)
+        sc = sr.setdefault("scene_cycle_extended", {})
+        sc["slots"] = slots
+        sc.setdefault("repeat_timeout", {"seconds": 3})
+        sc.setdefault("with_off", {"enabled": False})
+    print("switch-cycle %s [%s] -> %s"
+          % (name_of(b), CTRL_LABEL.get(ctrl, ctrl), args[2]))
+    _edit_behavior(hue, b, mutate, dry)
+
+
+def cmd_switch_action(hue, args, as_json, dry):
+    if len(args) < 3:
+        sys.exit("usage: ha-hue switch-action <switch> <button> <all_off|dim_up|dim_down|nothing>")
+    b = resolve_behavior(hue, args[0])
+    ctrl = resolve_button_ctrl(args[1])
+    rid = find_button_rid(hue, b, ctrl)
+    action = args[2].lower()
+    amap = {"all_off": "all_off", "dim_up": "dim_up", "dim_down": "dim_down",
+            "nothing": "do_nothing", "do_nothing": "do_nothing"}
+    if action not in amap:
+        sys.exit("ha-hue: bad action %r" % action)
+    act = amap[action]
+    evt = "on_repeat" if act in ("dim_up", "dim_down") else "on_short_release"
+
+    def mutate(cfg):
+        btn = cfg["buttons"][rid]
+        # clear conflicting short-release behaviors when setting a plain action
+        if evt == "on_short_release":
+            btn["on_short_release"] = {"action": act}
+        else:
+            btn[evt] = {"action": act}
+    print("switch-action %s [%s] %s -> %s"
+          % (name_of(b), CTRL_LABEL.get(ctrl, ctrl), evt, act))
+    _edit_behavior(hue, b, mutate, dry)
+
+
+def cmd_switch_swap_scene(hue, args, as_json, dry):
+    if len(args) < 3:
+        sys.exit("usage: ha-hue switch-swap-scene <switch> <oldScene> <newScene>")
+    b = resolve_behavior(hue, args[0])
+    room = _bound_room_name(hue, b)
+    old = resolve_scene(hue, args[1], room)["id"]
+    new = resolve_scene(hue, args[2], room)["id"]
+    count = [0]
+
+    def walk(o):
+        if isinstance(o, dict):
+            rec = o.get("recall")
+            if isinstance(rec, dict) and rec.get("rtype") == "scene" and rec.get("rid") == old:
+                rec["rid"] = new; count[0] += 1
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    def dedup_cycles(cfg):
+        for btn in cfg.get("buttons", {}).values():
+            for evt in btn.values():
+                if isinstance(evt, dict) and "scene_cycle_extended" in evt:
+                    slots = evt["scene_cycle_extended"].get("slots", [])
+                    out = []
+                    for slot in slots:
+                        rid = None
+                        for a in slot:
+                            rid = a.get("action", {}).get("recall", {}).get("rid")
+                        if not out or rid != out[-1][1]:
+                            out.append((slot, rid))
+                    evt["scene_cycle_extended"]["slots"] = [s for s, _ in out]
+
+    def mutate(cfg):
+        walk(cfg); dedup_cycles(cfg)
+    print("switch-swap-scene %s : %s -> %s (room %s)"
+          % (name_of(b), args[1], args[2], room))
+    _edit_behavior(hue, b, mutate, dry)
+    if not dry:
+        print("(%d recall reference(s) rewritten)" % count[0])
+
+
+# ---------------------------------------------------------------- dispatch
+TIER1 = {"lights", "rooms", "zones", "scenes", "scene", "switches", "switch", "raw"}
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__); return
+    as_json = "--json" in argv
+    dry = "--dry-run" in argv
+    yes = "--yes" in argv
+    argv = [a for a in argv if a not in ("--json", "--dry-run", "--yes")]
+    cmd, args = argv[0], argv[1:]
+    hue = Hue()
+
+    if cmd == "lights":
+        cmd_lights(hue, args, as_json)
+    elif cmd == "rooms":
+        cmd_rooms(hue, args, as_json, "room")
+    elif cmd == "zones":
+        cmd_rooms(hue, args, as_json, "zone")
+    elif cmd == "scenes":
+        cmd_scenes(hue, args, as_json)
+    elif cmd == "scene":
+        cmd_scene(hue, args, as_json)
+    elif cmd == "switches":
+        cmd_switches(hue, args, as_json)
+    elif cmd == "switch":
+        cmd_switch(hue, args, as_json)
+    elif cmd == "raw":
+        cmd_raw(hue, args, as_json)
+    elif cmd == "scene-recall":
+        cmd_scene_recall(hue, args, as_json, dry)
+    elif cmd == "scene-set":
+        cmd_scene_set(hue, args, as_json, dry)
+    elif cmd == "scene-create":
+        cmd_scene_create(hue, args, as_json, dry)
+    elif cmd == "scene-delete":
+        cmd_scene_delete(hue, args, as_json, dry, yes)
+    elif cmd == "switch-schedule":
+        cmd_switch_schedule(hue, args, as_json, dry)
+    elif cmd == "switch-cycle":
+        cmd_switch_cycle(hue, args, as_json, dry)
+    elif cmd == "switch-action":
+        cmd_switch_action(hue, args, as_json, dry)
+    elif cmd == "switch-swap-scene":
+        cmd_switch_swap_scene(hue, args, as_json, dry)
+    else:
+        sys.exit("ha-hue: unknown command %r (try --help)" % cmd)
+
+
+if __name__ == "__main__":
+    main()

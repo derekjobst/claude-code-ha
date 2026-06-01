@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""
+ha-refs - Find every config reference to a Home Assistant entity or device.
+
+Given one or more entity_ids and/or device_ids, scans the whole HA config for
+every place the id string appears, so a rename or delete won't silently break
+automations, dashboards, helpers, or Node-RED flows.
+
+WHY: device-based automation actions reference the raw 32-hex device_id, which
+an entity-slug grep misses. A device deletion broke automations this way. This
+tool auto-expands entity<->device so both forms get scanned.
+
+USAGE
+  ha-refs <id> [<id> ...]        One or more entity_ids and/or device_ids
+  ha-refs --json <id> ...        Machine-readable JSON output
+  ha-refs -h | --help            This help
+
+ID DETECTION
+  arg containing a '.'           treated as entity_id  (e.g. climate.hvac)
+  arg of 32 hex chars            treated as device_id
+
+AUTO-EXPAND
+  entity_id  -> also scans its device_id (from entity registry)
+  device_id  -> also scans every entity_id on that device
+
+WHAT IS SCANNED (read-only, via `ssh ha`)
+  1. YAML        /config/*.yaml + /config/packages/*.yaml  (file:line: line)
+  2. Dashboards  /config/.storage/lovelace*  (file + match count)
+  3. config_entries  /config/.storage/core.config_entries  (domain | title | json path)
+  4. Node-RED    /addon_configs/a0d7b954_nodered/flows.json  (match count)
+  5. Harmless    core.device_registry + trace.saved_traces  (reported, not actionable)
+
+Each id ends with a verdict line. Always exits 0.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+SSH_HOST = "ha"
+YAML_GLOBS = "/config/*.yaml /config/packages/*.yaml"
+LOVELACE_GLOB = "/config/.storage/lovelace*"
+CONFIG_ENTRIES = "/config/.storage/core.config_entries"
+NODERED_FLOWS = "/addon_configs/a0d7b954_nodered/flows.json"
+DEVICE_REGISTRY = "/config/.storage/core.device_registry"
+TRACE_GLOB = "/config/.storage/trace.saved_traces"
+
+HEX32 = re.compile(r"^[0-9a-f]{32}$")
+
+
+def is_device_id(arg):
+    return bool(HEX32.match(arg))
+
+
+def is_entity_id(arg):
+    return "." in arg and not is_device_id(arg)
+
+
+def ssh(cmd):
+    """Run a command on the HA box; return (stdout, returncode)."""
+    try:
+        r = subprocess.run(
+            ["ssh", SSH_HOST, cmd],
+            capture_output=True, text=True, timeout=60,
+        )
+        return r.stdout, r.returncode
+    except Exception as e:
+        return f"ERROR: {e}", 1
+
+
+# ----------------------------------------------------------------------------
+# Registry (loaded once, via ha-ws)
+# ----------------------------------------------------------------------------
+
+def load_entity_registry():
+    try:
+        r = subprocess.run(
+            ["ha-ws", "raw", "config/entity_registry/list"],
+            capture_output=True, text=True, timeout=60,
+        )
+        data = json.loads(r.stdout)
+        return data.get("result", [])
+    except Exception:
+        return []
+
+
+def device_id_for_entity(registry, entity_id):
+    for e in registry:
+        if e.get("entity_id") == entity_id:
+            return e.get("device_id")
+    return None
+
+
+def entities_for_device(registry, device_id):
+    return sorted(
+        e["entity_id"] for e in registry if e.get("device_id") == device_id
+    )
+
+
+# ----------------------------------------------------------------------------
+# Scanners (each takes the literal id string, returns structured results)
+# ----------------------------------------------------------------------------
+
+def scan_yaml(idstr):
+    """grep -rn across yaml. Returns list of {file, line, text}."""
+    out, _ = ssh(f"grep -rn -F {sh_quote(idstr)} {YAML_GLOBS} 2>/dev/null")
+    hits = []
+    for line in out.splitlines():
+        # format: /path/file.yaml:LINENO:matched text
+        m = re.match(r"^([^:]+):(\d+):(.*)$", line)
+        if m:
+            hits.append({
+                "file": m.group(1),
+                "line": int(m.group(2)),
+                "text": m.group(3).strip(),
+            })
+    return hits
+
+
+def scan_dashboards(idstr):
+    """grep -rln, then count per file. Returns list of {file, count}."""
+    out, _ = ssh(f"grep -rl -F {sh_quote(idstr)} {LOVELACE_GLOB} 2>/dev/null")
+    files = [f for f in out.splitlines() if f.strip()]
+    results = []
+    for f in files:
+        cnt_out, _ = ssh(f"grep -o -F {sh_quote(idstr)} {sh_quote(f)} 2>/dev/null | wc -l")
+        try:
+            count = int(cnt_out.strip())
+        except ValueError:
+            count = 0
+        results.append({"file": f, "count": count})
+    return results
+
+
+def scan_config_entries(idstr, config_entries_text):
+    """Recursively search every entry's nested values for idstr.
+    Returns list of {domain, title, path}."""
+    results = []
+    try:
+        data = json.loads(config_entries_text)
+    except Exception:
+        return results
+    entries = data.get("data", {}).get("entries", [])
+    for entry in entries:
+        domain = entry.get("domain", "?")
+        title = entry.get("title") or entry.get("unique_id") or "(no title)"
+        paths = []
+        _walk(entry, "", idstr, paths)
+        for p in paths:
+            results.append({"domain": domain, "title": title, "path": p})
+    return results
+
+
+def _walk(node, path, idstr, found):
+    """Recursively collect json paths where idstr appears as a substring."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            _walk(v, f"{path}.{k}" if path else k, idstr, found)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            _walk(v, f"{path}[{i}]", idstr, found)
+    elif isinstance(node, str):
+        if idstr in node:
+            found.append(path or "(root)")
+
+
+def scan_nodered(idstr):
+    """Match count in Node-RED flows.json (path is outside /config)."""
+    out, rc = ssh(f"grep -o -F {sh_quote(idstr)} {sh_quote(NODERED_FLOWS)} 2>/dev/null | wc -l")
+    try:
+        return int(out.strip())
+    except ValueError:
+        return 0
+
+
+def scan_harmless(idstr):
+    """Presence in device_registry + saved traces (NOT actionable)."""
+    dev_out, _ = ssh(f"grep -c -F {sh_quote(idstr)} {sh_quote(DEVICE_REGISTRY)} 2>/dev/null")
+    trace_out, _ = ssh(f"grep -c -F {sh_quote(idstr)} {TRACE_GLOB} 2>/dev/null")
+    try:
+        dev = int(dev_out.strip())
+    except ValueError:
+        dev = 0
+    trace = 0
+    # grep -c over a glob prints "file:count"; sum them
+    for line in trace_out.splitlines():
+        m = re.search(r"(\d+)\s*$", line)
+        if m:
+            trace += int(m.group(1))
+    return {"device_registry": dev, "saved_traces": trace}
+
+
+def sh_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+# ----------------------------------------------------------------------------
+# Per-id scan orchestration
+# ----------------------------------------------------------------------------
+
+def scan_id(idstr, config_entries_text):
+    """Run all scanners for one literal id string."""
+    return {
+        "id": idstr,
+        "yaml": scan_yaml(idstr),
+        "dashboards": scan_dashboards(idstr),
+        "config_entries": scan_config_entries(idstr, config_entries_text),
+        "nodered": scan_nodered(idstr),
+        "harmless": scan_harmless(idstr),
+    }
+
+
+def actionable_count(scan):
+    return (
+        len(scan["yaml"])
+        + sum(d["count"] for d in scan["dashboards"])
+        + len(scan["config_entries"])
+        + scan["nodered"]
+    )
+
+
+# ----------------------------------------------------------------------------
+# Output
+# ----------------------------------------------------------------------------
+
+def print_id_report(label, scan):
+    """Pretty-print one labeled id group."""
+    print(f"  [{label}] {scan['id']}")
+
+    if scan["yaml"]:
+        print(f"    YAML ({len(scan['yaml'])}):")
+        for h in scan["yaml"]:
+            print(f"      {h['file']}:{h['line']}: {h['text']}")
+    if scan["dashboards"]:
+        total = sum(d["count"] for d in scan["dashboards"])
+        print(f"    Dashboards ({total} in {len(scan['dashboards'])} file(s)):")
+        for d in scan["dashboards"]:
+            print(f"      {d['file']}: {d['count']} match(es)")
+    if scan["config_entries"]:
+        print(f"    config_entries ({len(scan['config_entries'])}):")
+        for c in scan["config_entries"]:
+            print(f"      {c['domain']} | {c['title']} | {c['path']}")
+    if scan["nodered"]:
+        print(f"    Node-RED: {scan['nodered']} match(es) in flows.json")
+
+    h = scan["harmless"]
+    if h["device_registry"] or h["saved_traces"]:
+        print("    harmless / ignore (deleted-devices list, historical traces):")
+        if h["device_registry"]:
+            print(f"      core.device_registry: {h['device_registry']} match(es)")
+        if h["saved_traces"]:
+            print(f"      trace.saved_traces: {h['saved_traces']} match(es)")
+
+    n = actionable_count(scan)
+    if n:
+        print(f"    ⚠ {n} actionable references (yaml/dashboards/config_entries/node-red)")
+    else:
+        print("    ✓ no actionable references — safe to rename/delete")
+
+
+def main():
+    args = sys.argv[1:]
+    json_output = False
+    if "--json" in args:
+        json_output = True
+        args.remove("--json")
+
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        sys.exit(0)
+
+    registry = load_entity_registry()
+
+    # Fetch core.config_entries once (large file, reused per id).
+    config_entries_text, _ = ssh(f"cat {CONFIG_ENTRIES}")
+
+    report = []
+
+    for arg in args:
+        group = {"input": arg, "groups": []}
+
+        if is_device_id(arg):
+            kind = "device_id"
+            # scan the device id itself
+            group["groups"].append({
+                "label": "device-id",
+                "scan": scan_id(arg, config_entries_text),
+            })
+            # expand: entities on this device
+            for ent in entities_for_device(registry, arg):
+                group["groups"].append({
+                    "label": f"entity-id (on device)",
+                    "scan": scan_id(ent, config_entries_text),
+                })
+        elif is_entity_id(arg):
+            kind = "entity_id"
+            group["groups"].append({
+                "label": "entity-id",
+                "scan": scan_id(arg, config_entries_text),
+            })
+            dev = device_id_for_entity(registry, arg)
+            if dev:
+                group["device_id"] = dev
+                group["groups"].append({
+                    "label": "device-id (auto-expanded)",
+                    "scan": scan_id(dev, config_entries_text),
+                })
+        else:
+            kind = "unknown"
+            group["groups"].append({
+                "label": "raw-string",
+                "scan": scan_id(arg, config_entries_text),
+            })
+
+        group["kind"] = kind
+        total = sum(actionable_count(g["scan"]) for g in group["groups"])
+        group["actionable_total"] = total
+        report.append(group)
+
+    if json_output:
+        print(json.dumps(report, indent=2))
+        sys.exit(0)
+
+    for i, group in enumerate(report):
+        if i:
+            print()
+        header = f"=== {group['input']}  ({group['kind']})"
+        if group.get("device_id"):
+            header += f"  → device {group['device_id']}"
+        print(header + " ===")
+        for g in group["groups"]:
+            print_id_report(g["label"], g["scan"])
+        # overall verdict for the arg
+        t = group["actionable_total"]
+        if t:
+            print(f"  ══ {group['input']}: ⚠ {t} total actionable references")
+        else:
+            print(f"  ══ {group['input']}: ✓ no actionable references — safe to rename/delete")
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

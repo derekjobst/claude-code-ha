@@ -6,16 +6,22 @@ Pushes local lovelace dashboard changes to HA without requiring a restart.
 https://github.com/danbuhler/claude-code-ha
 
 Usage:
-  1. Edit your .storage/lovelace file
-  2. Run: lovelace-sync
-  3. Refresh your browser/app to see changes
+  lovelace-sync                              # default dashboard, local file
+  lovelace-sync --dashboard dashboard_home   # named dashboard (.storage/lovelace.dashboard_home)
+  lovelace-sync --ssh ha                     # fetch file from remote host via ssh
+  lovelace-sync --ssh ha --dashboard dashboard_home
+  lovelace-sync /path/to/file                # explicit path (local)
 """
 
-import json
+import argparse
 import asyncio
-import ssl
+import json
 import os
+import shutil
+import ssl
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import websockets
@@ -37,19 +43,57 @@ def find_env_file():
     return None
 
 
-def find_lovelace_file():
-    """Find the lovelace storage file."""
+def storage_name(dashboard):
+    """Map a dashboard URL path (e.g. 'dashboard-status') to its storage
+    filename ('lovelace.dashboard_status'). HA replaces '-' with '_' in
+    filenames. dashboard=None -> the default 'lovelace' (no suffix variant)."""
+    if not dashboard:
+        return "lovelace"
+    return f"lovelace.{dashboard.replace('-', '_')}"
+
+
+def find_lovelace_file(dashboard=None):
+    """Find the lovelace storage file. dashboard=None -> default 'lovelace'."""
+    name = storage_name(dashboard)
     locations = [
-        '/root/config/.storage/lovelace',
-        '/config/.storage/lovelace',
-        '/homeassistant/.storage/lovelace',
-        './.storage/lovelace',
+        f'/root/config/.storage/{name}',
+        f'/config/.storage/{name}',
+        f'/homeassistant/.storage/{name}',
+        f'./.storage/{name}',
     ]
 
     for f in locations:
         if os.path.exists(f):
             return f
     return None
+
+
+def fetch_remote_lovelace(ssh_host, dashboard=None):
+    """Fetch the .storage/lovelace[.<dashboard>] file from a remote host via ssh."""
+    name = storage_name(dashboard)
+    # Standard HA paths; first one that exists wins on the remote side.
+    remote_cmd = (
+        f'for p in /config/.storage/{name} /homeassistant/.storage/{name} '
+        f'/root/config/.storage/{name}; do '
+        f'  if [ -f "$p" ]; then cat "$p"; exit 0; fi; '
+        f'done; '
+        f'echo "lovelace-sync: not found on remote: {name}" >&2; exit 2'
+    )
+    result = subprocess.run(
+        ['ssh', ssh_host, remote_cmd],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"Error fetching from {ssh_host}: {result.stderr.strip()}", file=sys.stderr)
+        return None
+
+    tmp = tempfile.NamedTemporaryFile(
+        prefix=f"lovelace-{dashboard or 'default'}-", suffix=".json",
+        delete=False, mode='w'
+    )
+    tmp.write(result.stdout)
+    tmp.close()
+    return tmp.name
 
 
 def load_env(env_file):
@@ -61,7 +105,7 @@ def load_env(env_file):
                 os.environ[key] = value
 
 
-async def sync_lovelace(lovelace_file):
+async def sync_lovelace(lovelace_file, dashboard=None):
     """Push lovelace config to Home Assistant."""
     token = os.environ.get('HA_TOKEN')
     url = os.environ.get('HA_URL', 'https://172.30.32.1:8128')
@@ -71,7 +115,24 @@ async def sync_lovelace(lovelace_file):
         return False
 
     # Convert to WebSocket URL
-    ws_url = url.replace('https://', 'wss://').replace('http://', 'ws://') + '/api/websocket'
+    ws_base = url.replace('https://', 'wss://').replace('http://', 'ws://')
+    # macOS Python's getaddrinfo doesn't use mDNSResponder, so it can't resolve
+    # .local hostnames the way curl/ping do. Substitute the IP from dscacheutil
+    # (mirrors ha-ws) so websockets.connect can proceed.
+    import re, subprocess as _sp
+    m = re.match(r'^(wss?://)([^:/]+)(.*)$', ws_base)
+    if m and m.group(2).endswith('.local'):
+        try:
+            r = _sp.run(['dscacheutil', '-q', 'host', '-a', 'name', m.group(2)],
+                        capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if line.startswith('ip_address:'):
+                    ws_base = f'{m.group(1)}{line.split()[1]}{m.group(3)}'
+                    break
+        except Exception:
+            pass
+    ws_url = ws_base + '/api/websocket'
+    use_ssl = ws_url.startswith('wss://')
 
     # Load the lovelace file
     print(f"Reading {lovelace_file}...")
@@ -83,15 +144,19 @@ async def sync_lovelace(lovelace_file):
 
     view_count = len(config.get('views', []))
     view_paths = [v.get('path', '?') for v in config.get('views', [])]
-    print(f"Found {view_count} views: {view_paths}")
+    target = f"dashboard '{dashboard}'" if dashboard else "default dashboard"
+    print(f"Found {view_count} views: {view_paths} ({target})")
 
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
+    connect_kwargs = {}
+    if use_ssl:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        connect_kwargs['ssl'] = ssl_context
 
-    print(f"Connecting to Home Assistant...")
+    print(f"Connecting to Home Assistant at {ws_url}...")
 
-    async with websockets.connect(ws_url, ssl=ssl_context) as ws:
+    async with websockets.connect(ws_url, **connect_kwargs) as ws:
         # Wait for auth_required
         msg = json.loads(await ws.recv())
 
@@ -108,13 +173,17 @@ async def sync_lovelace(lovelace_file):
             print(f"Auth failed: {msg}")
             return False
 
-        # Send lovelace save command
+        # Send lovelace save command. url_path scopes the save to a specific
+        # dashboard; omitting it targets the default dashboard.
         print("Pushing config to Home Assistant...")
-        await ws.send(json.dumps({
+        save_msg = {
             "id": 1,
             "type": "lovelace/config/save",
-            "config": config
-        }))
+            "config": config,
+        }
+        if dashboard:
+            save_msg["url_path"] = dashboard
+        await ws.send(json.dumps(save_msg))
 
         # Wait for result
         msg = json.loads(await ws.recv())
@@ -127,6 +196,24 @@ async def sync_lovelace(lovelace_file):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Sync .storage/lovelace[.dashboard] to Home Assistant via WebSocket."
+    )
+    parser.add_argument(
+        '--dashboard', '-d',
+        help="Dashboard slug (e.g. 'dashboard_home'). Omit for the default dashboard."
+    )
+    parser.add_argument(
+        '--ssh',
+        metavar='HOST',
+        help="Fetch the lovelace file from HOST via ssh instead of reading it locally."
+    )
+    parser.add_argument(
+        'path', nargs='?',
+        help="Explicit path to a lovelace storage file (overrides --dashboard/--ssh discovery)."
+    )
+    args = parser.parse_args()
+
     # Find and load env
     env_file = find_env_file()
     if env_file:
@@ -136,20 +223,32 @@ def main():
         print("Create a .env file with HA_URL and HA_TOKEN")
         sys.exit(1)
 
-    # Find lovelace file
-    lovelace_file = sys.argv[1] if len(sys.argv) > 1 else find_lovelace_file()
+    cleanup_path = None
+    if args.path:
+        lovelace_file = args.path
+    elif args.ssh:
+        lovelace_file = fetch_remote_lovelace(args.ssh, args.dashboard)
+        cleanup_path = lovelace_file
+    else:
+        lovelace_file = find_lovelace_file(args.dashboard)
 
     if not lovelace_file:
-        print("Error: Could not find .storage/lovelace file")
-        print("Searched: /config/.storage/lovelace, /homeassistant/.storage/lovelace")
-        print("Usage: lovelace-sync [path/to/.storage/lovelace]")
+        name = storage_name(args.dashboard)
+        print(f"Error: Could not find .storage/{name} file")
+        print("Hint: pass --ssh <host> to fetch from a remote HA instance,")
+        print("      or pass an explicit path as the last argument.")
         sys.exit(1)
 
     if not os.path.exists(lovelace_file):
         print(f"Error: {lovelace_file} not found")
         sys.exit(1)
 
-    success = asyncio.run(sync_lovelace(lovelace_file))
+    try:
+        success = asyncio.run(sync_lovelace(lovelace_file, args.dashboard))
+    finally:
+        if cleanup_path and os.path.exists(cleanup_path):
+            os.unlink(cleanup_path)
+
     sys.exit(0 if success else 1)
 
 

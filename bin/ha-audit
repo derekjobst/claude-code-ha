@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""
+ha-audit - Home Assistant registry/state hygiene report (read-only)
+
+Surfaces entity-cleanup candidates by cross-referencing the entity/device
+registries (read over SSH from /config/.storage/core.*) with live state
+(/api/states). Read-only: it never writes to HA. Always exits 0.
+
+SECTIONS
+  1 DANGLING       Registry entities with NO live state and not disabled
+                   (truly orphaned registry rows).
+  2 UNAVAILABLE    Entities whose live state is unavailable/unknown,
+                   grouped by integration. Often normal.
+  3 COLLISIONS     entity_ids ending in _<N> that look like re-registration
+                   / duplicate-name artifacts, grouped by stem.
+  4 DEFAULTS       Devices/entities that look auto-named (hex blobs, MAC
+                   fragments, IP-ish, name==mfr/model, unifi_default...).
+  5 ENTITYLESS     Devices with zero entities (often legit bridges/hubs).
+  6 DISABLED       Count of disabled entities per integration.
+
+USAGE
+  ha-audit                       Full report (all sections)
+  ha-audit --section 3           One section by number (1-6)
+  ha-audit --section collisions  One section by name
+  ha-audit --json                Machine-readable JSON for all/selected
+  ha-audit --ssh <host>          SSH host alias for the HA box (default: ha)
+
+SECTION NAMES
+  1=dangling  2=unavailable  3=collisions  4=defaults
+  5=entityless  6=disabled
+
+DATA SOURCES
+  registries : ssh <host> cat /config/.storage/core.{entity,device,config}_registry
+  live state : ha-api get states  (full /api/states objects)
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+SECTION_NAMES = {
+    "1": "dangling", "dangling": "dangling",
+    "2": "unavailable", "unavailable": "unavailable", "unknown": "unavailable",
+    "3": "collisions", "collisions": "collisions", "collision": "collisions",
+    "4": "defaults", "defaults": "defaults", "default": "defaults",
+    "5": "entityless", "entityless": "entityless", "entity-less": "entityless",
+    "6": "disabled", "disabled": "disabled",
+}
+SECTION_ORDER = ["dangling", "unavailable", "collisions", "defaults", "entityless", "disabled"]
+
+TRUNCATE = 10
+
+
+def _err(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+
+
+def _ssh_json(host, path):
+    """Read a JSON file from the HA box over SSH."""
+    try:
+        r = subprocess.run(
+            ["ssh", host, f"cat {path}"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as e:
+        _err(f"ssh {host} failed: {e}")
+        sys.exit(0)
+    if r.returncode != 0:
+        _err(f"ssh {host} cat {path} failed: {r.stderr.strip()}")
+        sys.exit(0)
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        _err(f"could not parse {path}: {e}")
+        sys.exit(0)
+
+
+def _live_states():
+    """Fetch full live state objects via ha-api get states."""
+    try:
+        r = subprocess.run(
+            ["ha-api", "get", "states"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as e:
+        _err(f"ha-api get states failed: {e}")
+        sys.exit(0)
+    if r.returncode != 0:
+        _err(f"ha-api get states failed: {r.stderr.strip()}")
+        sys.exit(0)
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        _err(f"could not parse ha-api states output: {e}")
+        sys.exit(0)
+
+
+def object_id(entity_id):
+    return entity_id.split(".", 1)[1] if "." in entity_id else entity_id
+
+
+def device_integration(dev, ce_by_id):
+    """Best-effort integration name for a device."""
+    pce = dev.get("primary_config_entry")
+    if pce and pce in ce_by_id:
+        return ce_by_id[pce]
+    for cid in dev.get("config_entries") or []:
+        if cid in ce_by_id:
+            return ce_by_id[cid]
+    for ident in dev.get("identifiers") or []:
+        if isinstance(ident, list) and ident:
+            return ident[0]
+    return "unknown"
+
+
+def truncate_list(items):
+    """Return (shown, extra) where shown is at most TRUNCATE items."""
+    if len(items) <= TRUNCATE:
+        return items, 0
+    return items[:TRUNCATE], len(items) - TRUNCATE
+
+
+def print_list(items):
+    shown, extra = truncate_list(items)
+    for it in shown:
+        print(f"  {it}")
+    if extra:
+        print(f"  ... +{extra} more")
+
+
+# ==============================================================================
+# AUDIT LOGIC
+# ==============================================================================
+
+def build_data(host):
+    entity_reg = _ssh_json(host, "/config/.storage/core.entity_registry")
+    device_reg = _ssh_json(host, "/config/.storage/core.device_registry")
+    config_entries = _ssh_json(host, "/config/.storage/core.config_entries")
+    states = _live_states()
+
+    entities = entity_reg["data"]["entities"]
+    devices = device_reg["data"]["devices"]
+    ce_by_id = {c["entry_id"]: c["domain"] for c in config_entries["data"]["entries"]}
+    state_by_id = {s["entity_id"]: s for s in states}
+
+    return {
+        "entities": entities,
+        "devices": devices,
+        "ce_by_id": ce_by_id,
+        "state_by_id": state_by_id,
+    }
+
+
+def audit_dangling(d):
+    """Registry entities with no live state and not disabled."""
+    state_by_id = d["state_by_id"]
+    out = []
+    for e in d["entities"]:
+        eid = e["entity_id"]
+        if eid in state_by_id:
+            continue
+        if e.get("disabled_by"):
+            continue
+        out.append({"entity_id": eid, "platform": e.get("platform") or "unknown"})
+    out.sort(key=lambda x: (x["platform"], x["entity_id"]))
+    return out
+
+
+def audit_unavailable(d):
+    """Live state unavailable/unknown, grouped by integration."""
+    platform_by_id = {e["entity_id"]: (e.get("platform") or "unknown") for e in d["entities"]}
+    groups = defaultdict(list)
+    for s in d["state_by_id"].values():
+        if s["state"] in ("unavailable", "unknown"):
+            eid = s["entity_id"]
+            plat = platform_by_id.get(eid, "unknown")
+            groups[plat].append({"entity_id": eid, "state": s["state"]})
+    for plat in groups:
+        groups[plat].sort(key=lambda x: x["entity_id"])
+    return dict(sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])))
+
+
+def audit_collisions(d):
+    """object_ids ending in _<N>; group by stem; flag 2+ members or base collision."""
+    suffix_re = re.compile(r"^(.*)_(\d+)$")
+    all_object_ids = set()
+    for e in d["entities"]:
+        all_object_ids.add(e["entity_id"])
+
+    stems = defaultdict(list)  # full_stem_entity_id -> [members]
+    for e in d["entities"]:
+        eid = e["entity_id"]
+        domain = eid.split(".", 1)[0]
+        oid = object_id(eid)
+        m = suffix_re.match(oid)
+        if not m:
+            continue
+        stem_oid = m.group(1)
+        stem_eid = f"{domain}.{stem_oid}"
+        stems[stem_eid].append(eid)
+
+    groups = []
+    for stem_eid, members in stems.items():
+        base_exists = stem_eid in all_object_ids
+        if len(members) >= 2 or base_exists:
+            all_members = sorted(set(members) | ({stem_eid} if base_exists else set()))
+            groups.append({
+                "stem": stem_eid,
+                "base_exists": base_exists,
+                "members": all_members,
+            })
+    groups.sort(key=lambda g: (-len(g["members"]), g["stem"]))
+    return groups
+
+
+HEX_BLOB = re.compile(r"[0-9a-f]{8,}")
+MAC_FRAG = re.compile(r"(_[0-9a-f]{2}){3,}")
+IP_ISH = re.compile(r"_\d+_\d+_\d+")
+
+
+def _looks_auto_named_oid(oid):
+    if HEX_BLOB.search(oid):
+        return "hex"
+    if MAC_FRAG.search(oid):
+        return "mac"
+    if IP_ISH.search(oid):
+        return "ip"
+    return None
+
+
+def audit_defaults(d):
+    """Auto-named devices/entities grouped by integration."""
+    groups = defaultdict(list)  # integration -> [reason strings]
+
+    for e in d["entities"]:
+        eid = e["entity_id"]
+        oid = object_id(eid)
+        reason = _looks_auto_named_oid(oid)
+        if reason:
+            plat = e.get("platform") or "unknown"
+            groups[plat].append({"kind": "entity", "id": eid, "reason": reason})
+
+    ce_by_id = d["ce_by_id"]
+    for dev in d["devices"]:
+        if dev.get("name_by_user"):
+            continue
+        name = (dev.get("name") or "").strip()
+        if not name:
+            continue
+        integ = device_integration(dev, ce_by_id)
+        reason = None
+        if name.lower().startswith("unifi_default") or "unifi_default" in name.lower():
+            reason = "unifi_default"
+        elif name == dev.get("manufacturer") or name == dev.get("model"):
+            reason = "name==mfr/model"
+        elif _looks_auto_named_oid(name.lower().replace(" ", "_")):
+            reason = _looks_auto_named_oid(name.lower().replace(" ", "_"))
+        if reason:
+            label = f"{name} [{dev['id'][:8]}]"
+            groups[integ].append({"kind": "device", "id": label, "reason": reason})
+
+    for k in groups:
+        groups[k].sort(key=lambda x: x["id"])
+    return dict(sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])))
+
+
+def audit_entityless(d):
+    """Devices with zero entities, listed with integration."""
+    ce_by_id = d["ce_by_id"]
+    devices_with_entities = set()
+    for e in d["entities"]:
+        if e.get("device_id"):
+            devices_with_entities.add(e["device_id"])
+
+    out = []
+    for dev in d["devices"]:
+        if dev["id"] in devices_with_entities:
+            continue
+        name = dev.get("name_by_user") or dev.get("name") or dev["id"][:12]
+        integ = device_integration(dev, ce_by_id)
+        out.append({"name": name, "integration": integ, "id": dev["id"]})
+    out.sort(key=lambda x: (x["integration"], x["name"]))
+    return out
+
+
+def audit_disabled(d):
+    """Count of disabled entities per integration."""
+    counts = defaultdict(int)
+    for e in d["entities"]:
+        if e.get("disabled_by"):
+            counts[e.get("platform") or "unknown"] += 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+# ==============================================================================
+# RENDERING
+# ==============================================================================
+
+def render_dangling(res):
+    total = len(res)
+    print(f"== 1. DANGLING ({total}) ==")
+    print("   registry entities with no live state, not disabled (orphaned rows)")
+    if not total:
+        print("  (none)")
+        return
+    items = [f"{r['entity_id']}  [{r['platform']}]" for r in res]
+    print_list(items)
+
+
+def render_unavailable(res):
+    total = sum(len(v) for v in res.values())
+    print(f"== 2. UNAVAILABLE / UNKNOWN ({total}) ==")
+    print("   often normal - offline phones/TVs/laptops, cloud integrations")
+    if not total:
+        print("  (none)")
+        return
+    for plat, members in res.items():
+        print(f"  {plat} ({len(members)}):")
+        shown, extra = truncate_list(members)
+        for m in shown:
+            print(f"    {m['entity_id']} = {m['state']}")
+        if extra:
+            print(f"    ... +{extra} more")
+
+
+def render_collisions(res):
+    total = len(res)
+    print(f"== 3. ID COLLISIONS ({total} stems) ==")
+    print("   entity_ids ending in _<N> - re-registration / duplicate-name artifacts")
+    if not total:
+        print("  (none)")
+        return
+    shown, extra = truncate_list(res)
+    for g in shown:
+        flag = " (base exists)" if g["base_exists"] else ""
+        print(f"  {g['stem']}{flag}:")
+        for m in g["members"]:
+            print(f"    {m}")
+    if extra:
+        print(f"  ... +{extra} more stems")
+
+
+def render_defaults(res):
+    total = sum(len(v) for v in res.values())
+    print(f"== 4. DEFAULT / MAC / HEX-NAMED ({total}) ==")
+    print("   auto-named devices/entities (hex blob, MAC, IP-ish, name==mfr/model)")
+    if not total:
+        print("  (none)")
+        return
+    for integ, members in res.items():
+        print(f"  {integ} ({len(members)}):")
+        shown, extra = truncate_list(members)
+        for m in shown:
+            print(f"    [{m['kind']}/{m['reason']}] {m['id']}")
+        if extra:
+            print(f"    ... +{extra} more")
+
+
+def render_entityless(res):
+    total = len(res)
+    print(f"== 5. ENTITY-LESS DEVICES ({total}) ==")
+    print("   devices with zero registry entities - many are legit bridges/hubs")
+    if not total:
+        print("  (none)")
+        return
+    items = [f"{r['name']}  [{r['integration']}]" for r in res]
+    print_list(items)
+
+
+def render_disabled(res):
+    total = sum(res.values())
+    print(f"== 6. DISABLED ({total}) ==")
+    print("   disabled entities per integration")
+    if not total:
+        print("  (none)")
+        return
+    for integ, n in res.items():
+        print(f"  {integ}: {n}")
+
+
+RENDERERS = {
+    "dangling": render_dangling,
+    "unavailable": render_unavailable,
+    "collisions": render_collisions,
+    "defaults": render_defaults,
+    "entityless": render_entityless,
+    "disabled": render_disabled,
+}
+
+AUDITORS = {
+    "dangling": audit_dangling,
+    "unavailable": audit_unavailable,
+    "collisions": audit_collisions,
+    "defaults": audit_defaults,
+    "entityless": audit_entityless,
+    "disabled": audit_disabled,
+}
+
+
+def main():
+    args = sys.argv[1:]
+    json_output = False
+    host = "ha"
+    section = None
+
+    i = 0
+    out_args = []
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help", "help"):
+            print(__doc__)
+            sys.exit(0)
+        elif a == "--json":
+            json_output = True
+        elif a == "--section":
+            if i + 1 >= len(args):
+                _err("--section needs a value (1-6 or name)")
+                sys.exit(0)
+            key = args[i + 1].lower()
+            if key not in SECTION_NAMES:
+                _err(f"unknown section: {args[i + 1]} (use 1-6 or {', '.join(SECTION_ORDER)})")
+                sys.exit(0)
+            section = SECTION_NAMES[key]
+            i += 1
+        elif a == "--ssh":
+            if i + 1 >= len(args):
+                _err("--ssh needs a host alias")
+                sys.exit(0)
+            host = args[i + 1]
+            i += 1
+        else:
+            out_args.append(a)
+        i += 1
+
+    if out_args:
+        _err(f"unknown argument(s): {' '.join(out_args)}")
+        sys.exit(0)
+
+    d = build_data(host)
+
+    sections = [section] if section else SECTION_ORDER
+    results = {name: AUDITORS[name](d) for name in sections}
+
+    if json_output:
+        print(json.dumps(results, indent=2, default=str))
+        sys.exit(0)
+
+    for idx, name in enumerate(sections):
+        if idx:
+            print()
+        RENDERERS[name](results[name])
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

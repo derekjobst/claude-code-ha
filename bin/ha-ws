@@ -21,6 +21,16 @@ REGISTRY COMMANDS
   area update <id> key=value...     Update area (name, icon, etc.)
   area delete <area_id>             Delete area
 
+CONFIG ENTRY COMMANDS
+  config-entry list [filter]        List config entries (filter on domain/title)
+  config-entry get <entry_id>       Full JSON detail for one entry
+  config-entry reload <entry_id>    Reload a config entry (recover stuck integration)
+  config-entry disable <entry_id>   Disable a config entry
+  config-entry enable <entry_id>    Enable a config entry
+  config-entry delete <entry_id> --yes
+                                    Delete entry + its devices/entities (REST DELETE)
+                                    Without --yes, prints what would be deleted
+
 STATE & SERVICE COMMANDS
   state <entity_id>                 Get current state of entity
   states [domain]                   List all states (optionally filter by domain)
@@ -110,21 +120,38 @@ class HAWebSocket:
 
         self.ha_url = os.environ.get('HA_URL', '').replace('https://', 'wss://').replace('http://', 'ws://')
         self.ha_token = os.environ.get('HA_TOKEN', '')
+        # macOS Python's getaddrinfo doesn't use mDNSResponder, so it
+        # can't resolve .local hostnames the way curl/ping do. Substitute
+        # the IP from dscacheutil so websockets.connect can proceed.
+        import re, subprocess as _sp
+        m = re.match(r'^(wss?://)([^:/]+)(.*)$', self.ha_url)
+        if m and m.group(2).endswith('.local'):
+            try:
+                r = _sp.run(['dscacheutil', '-q', 'host', '-a', 'name', m.group(2)],
+                            capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    if line.startswith('ip_address:'):
+                        self.ha_url = f'{m.group(1)}{line.split()[1]}{m.group(3)}'
+                        break
+            except Exception:
+                pass
 
     async def connect(self):
         if not self.ha_url or not self.ha_token:
             self._error("HA_URL and HA_TOKEN must be set in .env or environment")
             return False
 
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
+        connect_kwargs = {"max_size": 50_000_000}
+        if self.ha_url.startswith("wss://"):
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            connect_kwargs["ssl"] = ssl_ctx
 
         try:
             self.ws = await websockets.connect(
                 f'{self.ha_url}/api/websocket',
-                ssl=ssl_ctx,
-                max_size=50_000_000
+                **connect_kwargs,
             )
 
             msg = json.loads(await self.ws.recv())
@@ -188,6 +215,12 @@ def parse_value(v: str) -> Any:
         return float(v)
     except ValueError:
         pass
+
+    if (v.startswith('[') and v.endswith(']')) or (v.startswith('{') and v.endswith('}')):
+        try:
+            return json.loads(v)
+        except ValueError:
+            pass
 
     if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
         return v[1:-1]
@@ -559,6 +592,191 @@ async def area_delete(ha: HAWebSocket, area_id: str):
 
 
 # ==============================================================================
+# CONFIG ENTRY COMMANDS
+# ==============================================================================
+
+async def _config_entries(ha: HAWebSocket) -> Optional[list]:
+    """Fetch all config entries via WS, or None on error."""
+    result = await ha.send("config_entries/get")
+    if not result.get("success"):
+        ha._error(result.get("error", result))
+        return None
+    return result["result"]
+
+
+def _find_config_entry(entries: list, entry_id: str) -> Optional[dict]:
+    for e in entries:
+        if e.get("entry_id") == entry_id:
+            return e
+    # allow prefix match for convenience
+    for e in entries:
+        if e.get("entry_id", "").startswith(entry_id):
+            return e
+    return None
+
+
+async def config_entry_list(ha: HAWebSocket, filter_str: Optional[str] = None):
+    entries = await _config_entries(ha)
+    if entries is None:
+        return False
+
+    if filter_str:
+        f = filter_str.lower()
+        entries = [
+            e for e in entries
+            if f in (e.get("domain") or "").lower()
+            or f in (e.get("title") or "").lower()
+        ]
+
+    def fmt(data):
+        for e in sorted(data, key=lambda x: (x.get("domain") or "", x.get("title") or "")):
+            domain = (e.get("domain") or "")[:24]
+            title = (e.get("title") or "")[:34]
+            state = e.get("state") or ""
+            if e.get("disabled_by"):
+                state += f" (disabled:{e['disabled_by']})"
+            print(f"{domain:25} {title:35} {state:24} {e.get('entry_id')}")
+
+    ha._output(entries, fmt)
+    return True
+
+
+async def config_entry_get(ha: HAWebSocket, entry_id: str):
+    entries = await _config_entries(ha)
+    if entries is None:
+        return False
+
+    entry = _find_config_entry(entries, entry_id)
+    if not entry:
+        ha._error(f"Config entry not found: {entry_id}")
+        return False
+
+    print(json.dumps(entry, indent=2, default=str))
+    return True
+
+
+async def config_entry_reload(ha: HAWebSocket, entry_id: str):
+    result = await ha.send("config_entries/reload", entry_id=entry_id)
+    if not result.get("success"):
+        ha._error(result.get("error", result))
+        return False
+
+    res = result.get("result", {})
+    ha._print(f"Reloaded: {entry_id}")
+    if isinstance(res, dict) and "require_restart" in res:
+        ha._print(f"  require_restart = {res['require_restart']}")
+    ha._output(res, lambda d: None)
+    return True
+
+
+async def config_entry_set_disabled(ha: HAWebSocket, entry_id: str, disabled_by: Optional[str]):
+    result = await ha.send("config_entries/disable", entry_id=entry_id, disabled_by=disabled_by)
+    if not result.get("success"):
+        ha._error(result.get("error", result))
+        return False
+
+    res = result.get("result", {})
+    action = "Disabled" if disabled_by else "Enabled"
+    ha._print(f"{action}: {entry_id}")
+    if isinstance(res, dict) and "require_restart" in res:
+        ha._print(f"  require_restart = {res['require_restart']}")
+    return True
+
+
+def _rest_delete_config_entry(ha: HAWebSocket, entry_id: str) -> dict:
+    """Delete a config entry via REST DELETE (WS config_entries/remove is
+    unknown_command in this HA version). Reuses env + .local resolution but
+    keeps the http(s) scheme."""
+    import re
+    import subprocess as _sp
+    import urllib.request
+
+    url = os.environ.get("HA_URL", "")
+    token = os.environ.get("HA_TOKEN", "")
+    if not url or not token:
+        raise RuntimeError("HA_URL and HA_TOKEN must be set")
+
+    # Resolve .local host to an IP (macOS urllib getaddrinfo can't do mDNS).
+    m = re.match(r'^(https?://)([^:/]+)(.*)$', url)
+    if m and m.group(2).endswith('.local'):
+        try:
+            r = _sp.run(['dscacheutil', '-q', 'host', '-a', 'name', m.group(2)],
+                        capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if line.startswith('ip_address:'):
+                    url = f'{m.group(1)}{line.split()[1]}{m.group(3)}'
+                    break
+        except Exception:
+            pass
+
+    endpoint = f"{url.rstrip('/')}/api/config/config_entries/entry/{entry_id}"
+    req = urllib.request.Request(endpoint, method="DELETE")
+    req.add_header("Authorization", f"Bearer {token}")
+
+    ctx = None
+    if endpoint.startswith("https://"):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+        body = resp.read().decode()
+    return json.loads(body) if body else {}
+
+
+async def config_entry_delete(ha: HAWebSocket, entry_id: str, confirm: bool):
+    entries = await _config_entries(ha)
+    if entries is None:
+        return False
+
+    entry = _find_config_entry(entries, entry_id)
+    if not entry:
+        ha._error(f"Config entry not found: {entry_id}")
+        return False
+    entry_id = entry["entry_id"]
+
+    # Find devices and entities that will be removed alongside the entry.
+    dev_result = await ha.send("config/device_registry/list")
+    devices = []
+    if dev_result.get("success"):
+        devices = [d for d in dev_result["result"]
+                   if entry_id in (d.get("config_entries") or [])]
+
+    ent_result = await ha.send("config/entity_registry/list")
+    entities = []
+    if ent_result.get("success"):
+        entities = [e for e in ent_result["result"]
+                    if e.get("config_entry_id") == entry_id
+                    or entry_id in (e.get("config_entries") or [])]
+
+    if not confirm:
+        ha._print(f"Would delete config entry: {entry_id}")
+        ha._print(f"  domain = {entry.get('domain')}")
+        ha._print(f"  title  = {entry.get('title')}")
+        ha._print(f"  devices to remove: {len(devices)}")
+        for d in devices:
+            ha._print(f"    {d['id']}  {d.get('name_by_user') or d.get('name')}")
+        ha._print(f"  entities to remove: {len(entities)}")
+        for e in sorted(entities, key=lambda x: x["entity_id"]):
+            ha._print(f"    {e['entity_id']}")
+        ha._print("Re-run with --yes to actually delete.")
+        return True
+
+    try:
+        res = _rest_delete_config_entry(ha, entry_id)
+    except Exception as e:
+        ha._error(f"Delete failed: {e}")
+        return False
+
+    ha._print(f"Deleted: {entry_id} ({entry.get('domain')} / {entry.get('title')})")
+    if isinstance(res, dict) and "require_restart" in res:
+        ha._print(f"  require_restart = {res['require_restart']}")
+    if ha.json_output:
+        print(json.dumps(res, indent=2, default=str))
+    return True
+
+
+# ==============================================================================
 # STATE & SERVICE COMMANDS
 # ==============================================================================
 
@@ -772,6 +990,23 @@ async def run_command(args: list, json_output: bool = False, quiet: bool = False
                 return await area_update(ha, args[2], parse_kv_args(args[3:]))
             elif subcmd == "delete" and len(args) >= 3:
                 return await area_delete(ha, args[2])
+
+        elif cmd == "config-entry" and len(args) >= 2:
+            subcmd = args[1]
+            if subcmd == "list":
+                return await config_entry_list(ha, args[2] if len(args) > 2 else None)
+            elif subcmd == "get" and len(args) >= 3:
+                return await config_entry_get(ha, args[2])
+            elif subcmd == "reload" and len(args) >= 3:
+                return await config_entry_reload(ha, args[2])
+            elif subcmd == "disable" and len(args) >= 3:
+                return await config_entry_set_disabled(ha, args[2], "user")
+            elif subcmd == "enable" and len(args) >= 3:
+                return await config_entry_set_disabled(ha, args[2], None)
+            elif subcmd == "delete" and len(args) >= 3:
+                confirm = "--yes" in args
+                positional = [a for a in args[2:] if a != "--yes"]
+                return await config_entry_delete(ha, positional[0], confirm)
 
         elif cmd == "state" and len(args) >= 2:
             return await get_state(ha, args[1])
